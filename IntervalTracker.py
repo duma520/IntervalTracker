@@ -38,8 +38,8 @@ from PySide6.QtGui import (
 # ==================== 项目信息元数据 ====================
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "1.4.0"  # 更新版本号
-    BUILD_DATE = "2026-03-20"
+    VERSION = "1.5.0"  # 更新版本号（多线程优化版）
+    BUILD_DATE = "2026-08-08"
     AUTHOR = "杜玛"
     LICENSE = "GNU Affero General Public License v3.0"
     COPYRIGHT = "© 永久 杜玛"
@@ -171,8 +171,8 @@ class MacaronColors:
         ]
 
 # 数据库版本信息
-DATABASE_VERSION = "1.4.0"
-DATABASE_SCHEMA_VERSION = 3
+DATABASE_VERSION = "1.5.0"
+DATABASE_SCHEMA_VERSION = 4
 
 class SingletonMeta(type):
     """元类实现单例模式"""
@@ -247,6 +247,326 @@ class DatabaseConnectionPool(metaclass=SingletonMeta):
                     print(f"关闭连接失败 {db_path}: {e}")
             return False
 
+# ==================== 多线程任务管理系统 ====================
+
+class TaskManager(metaclass=SingletonMeta):
+    """全局任务管理器（管理后台QThread工作线程）"""
+    
+    def __init__(self):
+        self._active_tasks = {}
+        self._lock = threading.Lock()
+        self._max_concurrent = 8  # 最大并发线程数
+        
+    def submit(self, worker: "BackgroundWorker", task_id: str = None):
+        """提交后台任务（启动QThread）"""
+        if task_id:
+            with self._lock:
+                # 先清理已完成的任务
+                self._cleanup_finished()
+                self._active_tasks[task_id] = worker
+        # QThread 直接调用 start() 启动
+        worker.start()
+    
+    def cancel(self, task_id: str):
+        """取消任务"""
+        with self._lock:
+            if task_id in self._active_tasks:
+                worker = self._active_tasks[task_id]
+                worker.cancel()
+                del self._active_tasks[task_id]
+    
+    def wait_for_done(self, timeout_ms: int = 5000):
+        """等待所有活跃任务完成"""
+        import time as _time
+        deadline = _time.monotonic() + timeout_ms / 1000.0
+        with self._lock:
+            workers = list(self._active_tasks.values())
+        for worker in workers:
+            remaining = max(0, (deadline - _time.monotonic()) * 1000)
+            if remaining > 0:
+                worker.wait(int(remaining))
+        self._cleanup_finished()
+    
+    def _cleanup_finished(self):
+        """清理已完成的任务"""
+        finished = [tid for tid, w in self._active_tasks.items() if w.isFinished()]
+        for tid in finished:
+            del self._active_tasks[tid]
+    
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            self._cleanup_finished()
+            return len(self._active_tasks)
+
+
+class BackgroundWorker(QThread):
+    """后台工作线程基类（使用QThread + 信号槽）"""
+    
+    # 信号定义
+    finished_signal = Signal(object)   # 成功完成，携带结果
+    error_signal = Signal(str)         # 出错，携带错误信息
+    progress_signal = Signal(int, str) # 进度更新 (百分比, 消息)
+    started_signal = Signal()          # 任务开始
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._is_cancelled = False
+        self._result = None
+    
+    def cancel(self):
+        """取消任务"""
+        self._is_cancelled = True
+    
+    def is_cancelled(self) -> bool:
+        return self._is_cancelled
+    
+    def run(self):
+        """子类覆盖此方法执行实际工作"""
+        pass
+    
+    def get_result(self):
+        return self._result
+
+
+class DatabaseLoadWorker(BackgroundWorker):
+    """数据库加载工作线程（加载记录、标识、统计等）"""
+    
+    def __init__(self, db_path: str, load_type: str = "all", 
+                 category_id: int = None, keyword: str = None,
+                 parent=None):
+        super().__init__(parent)
+        self.db_path = db_path
+        self.load_type = load_type  # "records", "categories", "stats", "filter", "search", "all"
+        self.category_id = category_id
+        self.keyword = keyword
+        self.sort_mode = 0  # SORT_NEWEST_FIRST
+    
+    def run(self):
+        """在后台线程中加载数据"""
+        try:
+            self.started_signal.emit()
+            self.progress_signal.emit(0, "正在连接数据库...")
+            
+            if self.is_cancelled():
+                return
+            
+            db_pool = DatabaseConnectionPool()
+            conn = db_pool.get_connection(self.db_path)
+            cursor = conn.cursor()
+            
+            result = {"type": self.load_type}
+            
+            if self.load_type in ("categories", "all"):
+                self.progress_signal.emit(10, "正在加载标识...")
+                cursor.execute("""
+                    SELECT id, name, description, color, icon, sort_order, is_active, 
+                           created_at, updated_at
+                    FROM categories
+                    WHERE is_active = 1
+                    ORDER BY sort_order, name
+                """)
+                result["categories"] = [dict(row) for row in cursor.fetchall()]
+                
+                if self.is_cancelled():
+                    return
+            
+            if self.load_type in ("stats", "all"):
+                self.progress_signal.emit(20, "正在加载标识统计...")
+                cursor.execute("""
+                    SELECT 
+                        c.id, c.name, c.color,
+                        COUNT(r.id) as record_count,
+                        MAX(r.record_date || ' ' || r.record_time) as last_record_time,
+                        (SELECT r2.content FROM scheduling_records r2 
+                         WHERE r2.category_id = c.id 
+                         ORDER BY r2.record_date DESC, r2.record_time DESC 
+                         LIMIT 1) as last_content
+                    FROM categories c
+                    LEFT JOIN scheduling_records r ON c.id = r.category_id
+                    WHERE c.is_active = 1
+                    GROUP BY c.id
+                    ORDER BY c.sort_order, c.name
+                """)
+                result["stats"] = [dict(row) for row in cursor.fetchall()]
+                
+                if self.is_cancelled():
+                    return
+            
+            if self.load_type in ("records", "filter", "search", "all"):
+                self.progress_signal.emit(30, "正在加载记录...")
+                
+                # 构建查询
+                base_query = """
+                    SELECT r.id, r.category_id, r.record_date, r.record_time, 
+                           r.content, r.notes, r.created_at, r.updated_at,
+                           c.name as category_name, c.color
+                    FROM scheduling_records r
+                    JOIN categories c ON r.category_id = c.id
+                """
+                params = []
+                
+                if self.load_type == "filter" and self.category_id is not None:
+                    base_query += " WHERE r.category_id = ?"
+                    params.append(self.category_id)
+                
+                if self.sort_mode == 0:  # SORT_NEWEST_FIRST
+                    base_query += " ORDER BY r.record_date DESC, r.record_time DESC"
+                else:  # SORT_OLDEST_FIRST
+                    base_query += " ORDER BY r.record_date ASC, r.record_time ASC"
+                
+                cursor.execute(base_query, params)
+                
+                records = []
+                category_map = {}
+                for row in cursor.fetchall():
+                    record = {
+                        "id": row[0], "category_id": row[1],
+                        "record_date": row[2], "record_time": row[3],
+                        "content": row[4], "notes": row[5],
+                        "created_at": row[6], "updated_at": row[7]
+                    }
+                    category_map[row[1]] = row[8]
+                    
+                    # 搜索过滤（在Python中进行拼音搜索）
+                    if self.load_type == "search" and self.keyword:
+                        search_text = f"{row[8]} {row[4]} {row[5] or ''}"
+                        if SearchHelper.match_keyword(search_text, self.keyword):
+                            records.append(record)
+                    else:
+                        records.append(record)
+                    
+                    if self.is_cancelled():
+                        return
+                
+                result["records"] = records
+                result["category_map"] = category_map
+            
+            self.progress_signal.emit(90, "正在处理数据...")
+            
+            if not self.is_cancelled():
+                self._result = result
+                self.progress_signal.emit(100, "加载完成")
+                self.finished_signal.emit(result)
+            
+        except Exception as e:
+            if not self.is_cancelled():
+                self.error_signal.emit(f"数据加载失败: {str(e)}")
+
+
+class BackupWorker(BackgroundWorker):
+    """备份工作线程"""
+    
+    def __init__(self, backup_manager, backup_type: str = "manual", parent=None):
+        super().__init__(parent)
+        self.backup_manager = backup_manager
+        self.backup_type = backup_type
+    
+    def run(self):
+        """在后台线程中执行备份"""
+        try:
+            self.started_signal.emit()
+            self.progress_signal.emit(0, "正在创建备份...")
+            
+            if self.is_cancelled():
+                return
+            
+            self.progress_signal.emit(30, "正在复制数据库文件...")
+            backup_path = self.backup_manager.create_backup(self.backup_type)
+            
+            if self.is_cancelled():
+                return
+            
+            self.progress_signal.emit(80, "正在清理旧备份...")
+            
+            if backup_path:
+                self._result = {
+                    "success": True,
+                    "backup_path": backup_path,
+                    "file_size": backup_path.stat().st_size if backup_path else 0,
+                    "backup_time": self.backup_manager.last_backup_time
+                }
+                self.progress_signal.emit(100, "备份完成")
+                self.finished_signal.emit(self._result)
+            else:
+                self.error_signal.emit("备份创建失败：无法创建备份文件")
+                
+        except Exception as e:
+            if not self.is_cancelled():
+                self.error_signal.emit(f"备份失败: {str(e)}")
+
+
+class RestoreWorker(BackgroundWorker):
+    """恢复备份工作线程"""
+    
+    def __init__(self, backup_manager, backup_path, parent=None):
+        super().__init__(parent)
+        self.backup_manager = backup_manager
+        self.backup_path = backup_path
+    
+    def run(self):
+        """在后台线程中执行恢复"""
+        try:
+            self.started_signal.emit()
+            self.progress_signal.emit(0, "正在准备恢复...")
+            
+            if self.is_cancelled():
+                return
+            
+            self.progress_signal.emit(30, "正在创建回滚备份...")
+            
+            if self.is_cancelled():
+                return
+            
+            self.progress_signal.emit(50, "正在恢复数据库...")
+            success = self.backup_manager.restore_backup(self.backup_path)
+            
+            if self.is_cancelled():
+                return
+            
+            self.progress_signal.emit(90, "恢复完成，正在清理...")
+            
+            self._result = {"success": success}
+            self.progress_signal.emit(100, "恢复完成")
+            self.finished_signal.emit(self._result)
+            
+        except Exception as e:
+            if not self.is_cancelled():
+                self.error_signal.emit(f"恢复失败: {str(e)}")
+
+
+class DeleteUserWorker(BackgroundWorker):
+    """删除用户工作线程"""
+    
+    def __init__(self, user_manager, user_id: int, parent=None):
+        super().__init__(parent)
+        self.user_manager = user_manager
+        self.user_id = user_id
+    
+    def run(self):
+        """在后台线程中删除用户"""
+        try:
+            self.started_signal.emit()
+            self.progress_signal.emit(0, "正在删除用户数据...")
+            
+            if self.is_cancelled():
+                return
+            
+            success = self.user_manager.delete_user(self.user_id)
+            
+            self._result = {"success": success}
+            
+            if success:
+                self.progress_signal.emit(100, "删除完成")
+                self.finished_signal.emit(self._result)
+            else:
+                self.error_signal.emit("删除用户失败")
+                
+        except Exception as e:
+            if not self.is_cancelled():
+                self.error_signal.emit(f"删除用户失败: {str(e)}")
+
+# ==================== 用户管理器 ====================
 class UserManager:
     """用户管理器类"""
     
@@ -2304,7 +2624,7 @@ class UserEditDialog(QDialog):
             self.setWindowTitle(f"{ProjectInfo.get_full_name()} - 添加用户")
         
         self.setModal(True)
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(400)
         
         # 设置马卡龙背景色和文字颜色
         self.setStyleSheet(f"""
@@ -2329,13 +2649,48 @@ class UserEditDialog(QDialog):
             QPushButton:pressed {{
                 background-color: {MacaronColors.PINK_ROSE.name()};
             }}
-            QLineEdit {{
+            QLineEdit, QComboBox, QTextEdit {{
                 background-color: white;
                 border: 1px solid {MacaronColors.NEUTRAL_CARAMEL.name()};
                 border-radius: 5px;
                 padding: 5px;
                 color: {MacaronColors.TEXT_DARK.name()};
                 selection-background-color: {MacaronColors.PURPLE_LAVENDER.name()};
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: white;
+                color: {MacaronColors.TEXT_DARK.name()};
+                selection-background-color: {MacaronColors.PURPLE_LAVENDER.name()};
+                selection-color: {MacaronColors.TEXT_DARK.name()};
+            }}
+            QRadioButton {{
+                color: {MacaronColors.TEXT_DARK.name()};
+                spacing: 8px;
+            }}
+            QRadioButton::indicator {{
+                width: 18px;
+                height: 18px;
+                border-radius: 9px;
+                border: 1px solid {MacaronColors.NEUTRAL_CARAMEL.name()};
+                background-color: white;
+            }}
+            QRadioButton::indicator:checked {{
+                background-color: {MacaronColors.GREEN_MINT.name()};
+                border: 1px solid {MacaronColors.GREEN_MINT.name()};
+            }}
+            QGroupBox {{
+                font-weight: bold;
+                border: 2px solid {MacaronColors.GREEN_MINT.name()};
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+                color: {MacaronColors.TEXT_DARK.name()};
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: {MacaronColors.TEXT_DARK.name()};
             }}
         """)
         
@@ -2344,25 +2699,128 @@ class UserEditDialog(QDialog):
         if user_id:
             self._load_user_data()
     
+    
     def _setup_ui(self):
         """设置UI"""
-        layout = QFormLayout(self)
-        layout.setSpacing(10)
+        layout = QVBoxLayout(self)
+        
+        # 滚动区域（用于容纳更多内容）
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        # 基本信息组
+        info_group = QGroupBox("基本信息")
+        info_layout = QFormLayout(info_group)
+        info_layout.setSpacing(10)
         
         self.display_name_edit = QLineEdit()
         self.display_name_edit.setPlaceholderText("请输入显示名称")
-        layout.addRow("显示名称:", self.display_name_edit)
+        info_layout.addRow("显示名称:", self.display_name_edit)
         
         self.username_edit = QLineEdit()
         self.username_edit.setPlaceholderText("请输入用户名（可选）")
-        layout.addRow("用户名:", self.username_edit)
+        info_layout.addRow("用户名:", self.username_edit)
         
+        scroll_layout.addWidget(info_group)
+        
+        # 标识方案选择组（仅新建用户时显示）
+        self.scheme_group = QGroupBox("🏷️ 标识方案选择")
+        scheme_layout = QVBoxLayout(self.scheme_group)
+        
+        # 方案选择说明
+        scheme_desc = QLabel("请选择新用户的初始标识方案：")
+        scheme_desc.setStyleSheet(f"color: {MacaronColors.TEXT_MUTED.name()}; font-size: 12px;")
+        scheme_layout.addWidget(scheme_desc)
+        
+        # 单选按钮组
+        self.scheme_radio_group = QButtonGroup(self)
+        
+        # 方案1: 空白方案（完全空白）
+        self.blank_radio = QRadioButton("空白方案 - 完全空白（不添加任何标识）")
+        self.blank_radio.setToolTip("用户将没有任何预设标识，需要手动添加标识后才能记录")
+        self.scheme_radio_group.addButton(self.blank_radio)
+        scheme_layout.addWidget(self.blank_radio)
+        
+        # 方案2: 基础方案
+        self.basic_radio = QRadioButton("基础方案 - 简约实用（7个常用标识）")
+        self.basic_radio.setToolTip("包含：默认、工作、生活、学习、运动、娱乐、其他")
+        self.scheme_radio_group.addButton(self.basic_radio)
+        scheme_layout.addWidget(self.basic_radio)
+        
+        # 方案3: 完整方案
+        self.full_radio = QRadioButton("完整方案 - 功能全面（69个预设标识）")
+        self.full_radio.setToolTip("包含工作、生活、学习、健康、运动、饮食、创作等69个预设标识")
+        self.scheme_radio_group.addButton(self.full_radio)
+        scheme_layout.addWidget(self.full_radio)
+        
+        # 方案4: 工作生活方案
+        self.work_life_radio = QRadioButton("工作生活方案 - 平衡工作与生活")
+        self.work_life_radio.setToolTip("包含工作、会议、项目、任务、生活、家务、购物、财务等")
+        self.scheme_radio_group.addButton(self.work_life_radio)
+        scheme_layout.addWidget(self.work_life_radio)
+        
+        # 方案5: 学习成长方案
+        self.study_radio = QRadioButton("学习成长方案 - 专注学习提升")
+        self.study_radio.setToolTip("包含学习、读书、笔记、课程、考试、技能、编程、写作等")
+        self.scheme_radio_group.addButton(self.study_radio)
+        scheme_layout.addWidget(self.study_radio)
+        
+        # 方案6: 健康运动方案
+        self.health_radio = QRadioButton("健康运动方案 - 关注身心健康")
+        self.health_radio.setToolTip("包含健康、运动、跑步、健身、瑜伽、饮食、睡眠、用药等")
+        self.scheme_radio_group.addButton(self.health_radio)
+        scheme_layout.addWidget(self.health_radio)
+        
+        # 方案7: 家庭消费方案
+        self.family_radio = QRadioButton("家庭消费方案 - 记录家庭开支")
+        self.family_radio.setToolTip("包含家庭消费、食品采购、日用百货、服装鞋帽、电子产品等20个标识")
+        self.scheme_radio_group.addButton(self.family_radio)
+        scheme_layout.addWidget(self.family_radio)
+        
+        # 方案8: 创意创作方案
+        self.creative_radio = QRadioButton("创意创作方案 - 激发灵感")
+        self.creative_radio.setToolTip("包含创作、设计、摄影、音乐、电影、写作、绘画、手工等")
+        self.scheme_radio_group.addButton(self.creative_radio)
+        scheme_layout.addWidget(self.creative_radio)
+        
+        # 默认选中基础方案
+        self.basic_radio.setChecked(True)
+        
+        # 添加预览说明
+        preview_label = QLabel("💡 提示：后续可以在「标识管理」中随时添加、编辑或删除标识")
+        preview_label.setStyleSheet(f"""
+            QLabel {{
+                background-color: {MacaronColors.NEUTRAL_ALMOND.name()};
+                padding: 8px;
+                border-radius: 5px;
+                color: {MacaronColors.TEXT_MUTED.name()};
+                font-size: 11px;
+            }}
+        """)
+        preview_label.setWordWrap(True)
+        scheme_layout.addWidget(preview_label)
+        
+        scroll_layout.addWidget(self.scheme_group)
+        
+        # 如果是编辑用户，隐藏方案选择组
+        if self.user_id:
+            self.scheme_group.setVisible(False)
+        
+        scroll_layout.addStretch()
+        scroll_area.setWidget(scroll_widget)
+        layout.addWidget(scroll_area)
+        
+        # 按钮
         button_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
-        layout.addRow(button_box)
+        layout.addWidget(button_box)
+    
     
     def _load_user_data(self):
         """加载用户数据"""
@@ -2372,6 +2830,177 @@ class UserEditDialog(QDialog):
                 self.display_name_edit.setText(user['display_name'])
                 self.username_edit.setText(user['username'])
                 break
+
+    def _get_selected_scheme(self) -> str:
+        """获取选中的方案名称"""
+        if self.blank_radio.isChecked():
+            return "blank"
+        elif self.basic_radio.isChecked():
+            return "basic"
+        elif self.full_radio.isChecked():
+            return "full"
+        elif self.work_life_radio.isChecked():
+            return "work_life"
+        elif self.study_radio.isChecked():
+            return "study"
+        elif self.health_radio.isChecked():
+            return "health"
+        elif self.family_radio.isChecked():
+            return "family"
+        elif self.creative_radio.isChecked():
+            return "creative"
+        return "basic"
+
+    def _init_categories_for_new_user(self, db_path: str, scheme: str):
+        """为新用户初始化标识"""
+        if scheme == "blank":
+            # 空白方案：只添加一个默认标识（用于记录）
+            self._init_blank_categories(db_path)
+        else:
+            # 其他方案：使用对应的预设标识
+            self._init_with_preset_scheme(db_path, scheme)
+    
+    def _init_blank_categories(self, db_path: str):
+        """初始化空白标识（完全空白，不保留任何标识）"""
+        conn = self.user_manager.db_pool.get_connection(db_path)
+        cursor = conn.cursor()
+        
+        # 清空所有现有标识（包括默认标识）
+        cursor.execute("DELETE FROM categories")
+        
+        conn.commit()
+    
+    def _init_with_preset_scheme(self, db_path: str, scheme: str):
+        """使用预设方案初始化标识"""
+        # 预设方案定义
+        schemes = {
+            "basic": [
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("工作", "工作相关记录", MacaronColors.BLUE_SKY, 1),
+                ("生活", "日常生活记录", MacaronColors.GREEN_APPLE, 2),
+                ("学习", "学习进度记录", MacaronColors.PURPLE_LAVENDER, 3),
+                ("运动", "运动健康记录", MacaronColors.ORANGE_PEACH, 4),
+                ("娱乐", "娱乐休闲记录", MacaronColors.YELLOW_LEMON, 5),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+            ],
+            "work_life": [
+                ("工作", "工作相关记录", MacaronColors.BLUE_SKY, 1),
+                ("会议", "会议记录", MacaronColors.BLUE_MIST, 10),
+                ("项目", "项目进度", MacaronColors.BLUE_PERIWINKLE, 11),
+                ("任务", "任务清单", MacaronColors.BLUE_LAVENDER, 12),
+                ("报告", "工作报告", MacaronColors.PINK_SAKURA, 13),
+                ("客户", "客户沟通", MacaronColors.PINK_BALLET, 15),
+                ("生活", "日常生活记录", MacaronColors.GREEN_APPLE, 2),
+                ("家务", "家务劳动", MacaronColors.NEUTRAL_CARAMEL, 50),
+                ("购物", "购物清单", MacaronColors.NEUTRAL_CREAM, 51),
+                ("财务", "财务管理", MacaronColors.NEUTRAL_MOCHA, 52),
+                ("家庭", "家庭事务", MacaronColors.PINK_COTTON, 55),
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+            ],
+            "study": [
+                ("学习", "学习进度记录", MacaronColors.PURPLE_LAVENDER, 3),
+                ("读书", "阅读记录", MacaronColors.PURPLE_LAVENDER, 20),
+                ("笔记", "学习笔记", MacaronColors.PURPLE_TARO, 21),
+                ("课程", "课程学习", MacaronColors.PURPLE_WISTERIA, 22),
+                ("考试", "考试准备", MacaronColors.PURPLE_MAUVE, 23),
+                ("技能", "技能提升", MacaronColors.NEUTRAL_ALMOND, 24),
+                ("编程", "编程开发", MacaronColors.BLUE_PERIWINKLE, 90),
+                ("写作", "写作记录", MacaronColors.NEUTRAL_ALMOND, 92),
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+            ],
+            "health": [
+                ("健康", "健康状况记录", MacaronColors.TEAL_MINT, 6),
+                ("运动", "运动健康记录", MacaronColors.ORANGE_PEACH, 4),
+                ("跑步", "跑步记录", MacaronColors.ORANGE_PEACH, 40),
+                ("健身", "健身训练", MacaronColors.ORANGE_APRICOT, 41),
+                ("瑜伽", "瑜伽练习", MacaronColors.YELLOW_CREAM, 42),
+                ("饮食", "饮食记录", MacaronColors.ORANGE_APRICOT, 7),
+                ("睡眠", "睡眠记录", MacaronColors.GREEN_MINT, 30),
+                ("用药", "用药提醒", MacaronColors.GREEN_APPLE, 31),
+                ("体检", "体检记录", MacaronColors.GREEN_PISTACHIO, 32),
+                ("心理", "心理健康", MacaronColors.GREEN_SAGE, 33),
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+            ],
+            "family": [
+                ("家庭消费", "家庭日常消费", MacaronColors.PINK_COTTON, 110),
+                ("食品采购", "食品生鲜采购", MacaronColors.GREEN_APPLE, 111),
+                ("日用百货", "日用品百货", MacaronColors.BLUE_MIST, 112),
+                ("服装鞋帽", "服装鞋子帽子", MacaronColors.PINK_SAKURA, 113),
+                ("电子产品", "电子数码产品", MacaronColors.BLUE_PERIWINKLE, 114),
+                ("家居用品", "家具家居装饰", MacaronColors.NEUTRAL_CARAMEL, 115),
+                ("厨房用品", "厨房器具餐具", MacaronColors.ORANGE_APRICOT, 116),
+                ("美妆个护", "化妆品护理", MacaronColors.PURPLE_LAVENDER, 119),
+                ("医疗健康", "药品医疗服务", MacaronColors.RED_CORAL, 120),
+                ("教育支出", "培训课程费用", MacaronColors.PURPLE_TARO, 121),
+                ("交通出行", "交通加油费用", MacaronColors.BLUE_SKY, 122),
+                ("餐饮外卖", "外出就餐外卖", MacaronColors.ORANGE_PEACH, 124),
+                ("水电煤气", "生活缴费", MacaronColors.GREEN_PISTACHIO, 125),
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+            ],
+            "creative": [
+                ("创作", "创意创作", MacaronColors.ORANGE_PEACH, 64),
+                ("设计", "设计工作", MacaronColors.PINK_BALLET, 91),
+                ("摄影", "摄影记录", MacaronColors.ORANGE_PEACH, 93),
+                ("音乐", "音乐欣赏", MacaronColors.PURPLE_TARO, 61),
+                ("电影", "观影记录", MacaronColors.PURPLE_LAVENDER, 60),
+                ("写作", "写作记录", MacaronColors.NEUTRAL_ALMOND, 92),
+                ("绘画", "绘画创作", MacaronColors.PINK_SAKURA, 0),
+                ("手工", "手工制作", MacaronColors.YELLOW_CREAM, 0),
+                ("烹饪", "烹饪尝试", MacaronColors.GREEN_APPLE, 75),
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+            ],
+            "full": [
+                ("默认", "默认分类", MacaronColors.GREEN_MINT, 0),
+                ("工作", "工作相关记录", MacaronColors.BLUE_SKY, 1),
+                ("生活", "日常生活记录", MacaronColors.GREEN_APPLE, 2),
+                ("学习", "学习进度记录", MacaronColors.PURPLE_LAVENDER, 3),
+                ("运动", "运动健康记录", MacaronColors.ORANGE_PEACH, 4),
+                ("娱乐", "娱乐休闲记录", MacaronColors.YELLOW_LEMON, 5),
+                ("健康", "健康状况记录", MacaronColors.TEAL_MINT, 6),
+                ("饮食", "饮食记录", MacaronColors.ORANGE_APRICOT, 7),
+                ("其他", "其他记录", MacaronColors.NEUTRAL_CARAMEL, 8),
+                ("会议", "会议记录", MacaronColors.BLUE_MIST, 10),
+                ("项目", "项目进度", MacaronColors.BLUE_PERIWINKLE, 11),
+                ("任务", "任务清单", MacaronColors.BLUE_LAVENDER, 12),
+                ("报告", "工作报告", MacaronColors.PINK_SAKURA, 13),
+                ("读书", "阅读记录", MacaronColors.PURPLE_LAVENDER, 20),
+                ("笔记", "学习笔记", MacaronColors.PURPLE_TARO, 21),
+                ("课程", "课程学习", MacaronColors.PURPLE_WISTERIA, 22),
+                ("跑步", "跑步记录", MacaronColors.ORANGE_PEACH, 40),
+                ("健身", "健身训练", MacaronColors.ORANGE_APRICOT, 41),
+                ("家务", "家务劳动", MacaronColors.NEUTRAL_CARAMEL, 50),
+                ("购物", "购物清单", MacaronColors.NEUTRAL_CREAM, 51),
+                ("财务", "财务管理", MacaronColors.NEUTRAL_MOCHA, 52),
+                ("电影", "观影记录", MacaronColors.PURPLE_LAVENDER, 60),
+                ("音乐", "音乐欣赏", MacaronColors.PURPLE_TARO, 61),
+                ("睡眠", "睡眠记录", MacaronColors.GREEN_MINT, 30),
+                ("习惯", "习惯养成", MacaronColors.GREEN_MINT, 80),
+                ("编程", "编程开发", MacaronColors.BLUE_PERIWINKLE, 90),
+                ("设计", "设计工作", MacaronColors.PINK_BALLET, 91),
+            ],
+        }
+        
+        selected = schemes.get(scheme, schemes["basic"])
+        
+        conn = self.user_manager.db_pool.get_connection(db_path)
+        cursor = conn.cursor()
+        
+        # 清空现有标识
+        cursor.execute("DELETE FROM categories")
+        
+        # 添加预设标识
+        for name, desc, color_obj, sort_order in selected:
+            cursor.execute("""
+                INSERT INTO categories (name, description, color, sort_order)
+                VALUES (?, ?, ?, ?)
+            """, (name, desc, color_obj.name(), sort_order))
+        
+        conn.commit()
     
     def accept(self):
         """确认"""
@@ -2383,15 +3012,56 @@ class UserEditDialog(QDialog):
         username = self.username_edit.text().strip() or None
         
         if self.user_id:
+            # 编辑用户
             if self.user_manager.update_user(self.user_id, display_name, username):
                 super().accept()
             else:
                 QMessageBox.critical(self, "错误", "更新用户失败")
         else:
+            # 新建用户
+            # 获取选中的方案
+            selected_scheme = self._get_selected_scheme()
+            
+            # 先创建用户
             if self.user_manager.add_user(display_name, username):
-                super().accept()
+                # 获取新创建的用户信息
+                users = self.user_manager.get_all_users()
+                new_user = None
+                for user in users:
+                    if user['display_name'] == display_name:
+                        new_user = user
+                        break
+                
+                if new_user:
+                    db_path = Path.cwd() / ".scheduling_system" / new_user['db_file']
+                    
+                    # 根据方案初始化标识
+                    self._init_categories_for_new_user(str(db_path), selected_scheme)
+                    
+                    # 显示方案选择的结果
+                    scheme_names = {
+                        "blank": "空白方案",
+                        "basic": "基础方案",
+                        "full": "完整方案",
+                        "work_life": "工作生活方案",
+                        "study": "学习成长方案",
+                        "health": "健康运动方案",
+                        "family": "家庭消费方案",
+                        "creative": "创意创作方案"
+                    }
+                    
+                    QMessageBox.information(
+                        self, "创建成功",
+                        f"✅ 用户「{display_name}」创建成功！\n\n"
+                        f"📋 已应用方案：{scheme_names.get(selected_scheme, '基础方案')}\n\n"
+                        f"💡 提示：后续可以在「标识管理」中随时添加、编辑或删除标识。"
+                    )
+                    
+                    super().accept()
+                else:
+                    QMessageBox.critical(self, "错误", "创建用户失败")
             else:
-                QMessageBox.critical(self, "错误", "添加用户失败")
+                QMessageBox.critical(self, "错误", "创建用户失败")
 
 class BackupRestoreDialog(QDialog):
     """备份恢复对话框"""
@@ -2806,7 +3476,7 @@ class BackupRestoreDialog(QDialog):
         self.info_version.setText(info.get("database_version", "-"))
     
     def _manual_backup(self):
-        """手动备份（修复版）"""
+        """手动备份（异步多线程版）"""
         if not self.backup_manager:
             return
         
@@ -2814,45 +3484,52 @@ class BackupRestoreDialog(QDialog):
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # 忙碌状态
-        QCoreApplication.processEvents()  # 强制更新UI
+        QCoreApplication.processEvents()
         
-        try:
-            # 直接执行备份，不创建线程
-            backup_path = self.backup_manager.create_backup("manual")
-            
-            # 隐藏进度条
-            self.progress_bar.setVisible(False)
-            
-            if backup_path:
-                # 获取文件大小
-                file_size = backup_path.stat().st_size
-                if file_size < 1024:
-                    size_str = f"{file_size} B"
-                elif file_size < 1024 * 1024:
-                    size_str = f"{file_size / 1024:.2f} KB"
-                else:
-                    size_str = f"{file_size / (1024 * 1024):.2f} MB"
-                
-                QMessageBox.information(
-                    self, "成功", 
-                    f"✅ 备份创建成功\n"
-                    f"文件：{backup_path.name}\n"
-                    f"大小：{size_str}\n"
-                    f"耗时：{self.backup_manager.last_backup_time:.3f} 秒"
-                )
-                self._load_backups()
+        # 创建后台备份线程
+        self._backup_worker = BackupWorker(self.backup_manager, "manual")
+        self._backup_worker.finished_signal.connect(self._on_backup_complete)
+        self._backup_worker.error_signal.connect(self._on_backup_error)
+        TaskManager().submit(self._backup_worker)
+    
+    def _on_backup_complete(self, result):
+        """备份完成回调"""
+        self.progress_bar.setVisible(False)
+        
+        backup_path = result.get("backup_path")
+        file_size = result.get("file_size", 0)
+        backup_time = result.get("backup_time", 0)
+        
+        if backup_path:
+            if file_size < 1024:
+                size_str = f"{file_size} B"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.2f} KB"
             else:
-                QMessageBox.critical(self, "错误", "❌ 备份创建失败")
-        except Exception as e:
-            self.progress_bar.setVisible(False)
-            QMessageBox.critical(self, "错误", f"备份失败：{e}")
+                size_str = f"{file_size / (1024 * 1024):.2f} MB"
+            
+            QMessageBox.information(
+                self, "成功", 
+                f"✅ 备份创建成功\n"
+                f"文件：{Path(backup_path).name}\n"
+                f"大小：{size_str}\n"
+                f"耗时：{backup_time:.3f} 秒"
+            )
+            self._load_backups()
+        else:
+            QMessageBox.critical(self, "错误", "❌ 备份创建失败")
+    
+    def _on_backup_error(self, error_msg):
+        """备份出错回调"""
+        self.progress_bar.setVisible(False)
+        QMessageBox.critical(self, "错误", f"备份失败：{error_msg}")
     
     def _view_backup(self, backup_path: Path):
         """查看备份"""
         self._show_backup_info(backup_path)
     
     def _restore_backup(self, backup_path: Path = None):
-        """恢复备份"""
+        """恢复备份（异步多线程版）"""
         if backup_path is None:
             current_row = self.backup_table.currentRow()
             if current_row >= 0:
@@ -2867,11 +3544,36 @@ class BackupRestoreDialog(QDialog):
             )
             
             if reply == QMessageBox.Yes:
-                if self.backup_manager.restore_backup(backup_path):
-                    QMessageBox.information(self, "成功", "数据库恢复成功")
-                    self.accept()
-                else:
-                    QMessageBox.critical(self, "错误", "数据库恢复失败")
+                # 显示进度条
+                self.progress_bar = QProgressBar(self)
+                self.progress_bar.setVisible(True)
+                self.progress_bar.setRange(0, 0)
+                QCoreApplication.processEvents()
+                
+                # 创建后台恢复线程
+                self._restore_worker = RestoreWorker(self.backup_manager, backup_path)
+                self._restore_worker.finished_signal.connect(self._on_restore_complete)
+                self._restore_worker.error_signal.connect(self._on_restore_error)
+                self._restore_worker.progress_signal.connect(self._on_restore_progress)
+                TaskManager().submit(self._restore_worker)
+    
+    def _on_restore_complete(self, result):
+        """恢复完成回调"""
+        self.progress_bar.setVisible(False)
+        if result.get("success"):
+            QMessageBox.information(self, "成功", "数据库恢复成功")
+            self.accept()
+        else:
+            QMessageBox.critical(self, "错误", "数据库恢复失败")
+    
+    def _on_restore_error(self, error_msg):
+        """恢复出错回调"""
+        self.progress_bar.setVisible(False)
+        QMessageBox.critical(self, "错误", f"恢复失败：{error_msg}")
+    
+    def _on_restore_progress(self, percent, message):
+        """恢复进度回调"""
+        pass  # 进度信息可在状态栏显示
     
     def _delete_backup(self):
         """删除备份"""
@@ -3159,6 +3861,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.debug_mode = debug_mode
         self.user_manager = UserManager()
+        self.task_manager = TaskManager()  # 全局任务管理器
         self.current_user_id = None
         self.current_db_path = None
         self.backup_manager = None
@@ -3167,6 +3870,7 @@ class MainWindow(QMainWindow):
         self.auto_backup_timer.timeout.connect(self._auto_backup)
         self.categories = []
         self.categories_dict = {}
+        self._active_workers = []  # 跟踪活跃的后台工作线程
         
         self._setup_ui()
         self._load_settings()
@@ -4242,8 +4946,9 @@ class MainWindow(QMainWindow):
                 self.category_manager = CategoryManager(self.current_db_path)
                 
                 self._load_user_settings()
-                self._load_categories()
-                self._load_records()
+                
+                # 使用后台线程加载数据（避免UI卡顿）
+                self._async_load_all_data()
                 
                 self._start_auto_backup()
                 
@@ -4251,78 +4956,50 @@ class MainWindow(QMainWindow):
                 
                 break
     
-    def _load_categories(self):
-        """加载所有标识"""
-        if not self.category_manager:
-            return
-        
-        try:
-            self.categories = self.category_manager.get_all_categories()
-            self.categories_dict = {c['id']: c for c in self.categories}
-            
-            # 刷新主输入区的标识下拉框
-            self.category_combo.clear()
-            for category in self.categories:
-                self.category_combo.addItem(category['name'], category['id'])
-                index = self.category_combo.count() - 1
-                self.category_combo.setItemData(index, QColor(category['color']), Qt.ForegroundRole)
-                self.category_combo.setItemData(index, QBrush(QColor(category['color']).lighter(160)), Qt.BackgroundRole)
-            
-            if self.categories:
-                self.category_combo.setCurrentIndex(0)
-            
-            # 刷新筛选下拉框
-            self.category_filter.clear()
-            self.category_filter.addItem("全部", -1)
-            for category in self.categories:
-                self.category_filter.addItem(category['name'], category['id'])
-                index = self.category_filter.count() - 1
-                self.category_filter.setItemData(index, QColor(category['color']), Qt.ForegroundRole)
-                self.category_filter.setItemData(index, QBrush(QColor(category['color']).lighter(160)), Qt.BackgroundRole)
-            
-            # 刷新统计表格
-            self._load_category_stats()
-            
-        except Exception as e:
-            self._show_error("加载标识失败", str(e))
-    
-    def _load_records(self):
-        """加载记录"""
-        print("正在刷新记录列表...")  # 调试输出
+    def _async_load_all_data(self):
+        """异步加载所有数据"""
         if not self.current_db_path:
             return
         
+        # 显示加载进度
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # 忙碌状态
+        self.status_bar.showMessage("⏳ 正在加载数据...")
+        
+        # 创建后台工作线程
+        worker = DatabaseLoadWorker(self.current_db_path, "all")
+        worker.finished_signal.connect(self._on_data_loaded)
+        worker.error_signal.connect(self._on_data_load_error)
+        worker.progress_signal.connect(self._on_load_progress)
+        
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker, "load_all")
+    
+    def _on_data_loaded(self, result):
+        """数据加载完成（在主线程中回调）"""
         try:
-            conn = self.user_manager.db_pool.get_connection(self.current_db_path)
-            cursor = conn.cursor()
+            load_type = result.get("type", "all")
             
-            cursor.execute("""
-                SELECT r.id, r.category_id, r.record_date, r.record_time, 
-                       r.content, r.notes, r.created_at, r.updated_at,
-                       c.name as category_name, c.color
-                FROM scheduling_records r
-                JOIN categories c ON r.category_id = c.id
-                ORDER BY r.record_date DESC, r.record_time DESC
-            """)
+            if load_type in ("categories", "all"):
+                categories = result.get("categories", [])
+                if categories:
+                    self.categories = categories
+                    self.categories_dict = {c['id']: c for c in self.categories}
+                    self._update_category_combo()
+                    self._update_filter_combo()
             
-            records = []
-            category_map = {}
-            for row in cursor.fetchall():
-                records.append({
-                    "id": row[0],
-                    "category_id": row[1],
-                    "record_date": row[2],
-                    "record_time": row[3],
-                    "content": row[4],
-                    "notes": row[5],
-                    "created_at": row[6],
-                    "updated_at": row[7]
-                })
-                category_map[row[1]] = row[8]  # category_name
+            if load_type in ("stats", "all"):
+                stats = result.get("stats", [])
+                if stats:
+                    self._update_stats_table(stats)
             
-            self.records_model.set_records(records, category_map)
+            if load_type in ("records", "filter", "search", "all"):
+                records = result.get("records", [])
+                category_map = result.get("category_map", {})
+                if records is not None:
+                    self.records_model.set_records(records, category_map)
             
-            # 更新状态栏统计信息
+            # 更新状态栏统计
             stats = self.records_model.get_interval_stats()
             if stats:
                 min_interval = self._format_interval(stats["min"])
@@ -4333,25 +5010,130 @@ class MainWindow(QMainWindow):
                     5000
                 )
             
-            print(f"加载了 {len(records)} 条记录")  # 调试输出
+            # 更新当前标识统计
+            self._update_category_stats()
+            self._calculate_interval()
+            
         except Exception as e:
-            print(f"加载记录失败: {e}")
-            self._show_error("加载记录失败", str(e))
+            print(f"处理加载数据失败: {e}")
+        finally:
+            self.progress_bar.setVisible(False)
+            self._cleanup_worker("load_all")
     
-    def _load_category_stats(self, force_refresh=True):
-        """加载所有标识的统计信息"""
-        if not self.category_manager:
+    def _on_data_load_error(self, error_msg):
+        """数据加载出错"""
+        self.progress_bar.setVisible(False)
+        self._cleanup_worker("load_all")
+        self._show_error("加载失败", error_msg)
+    
+    def _on_load_progress(self, percent, message):
+        """加载进度更新"""
+        self.status_bar.showMessage(f"⏳ {message} ({percent}%)")
+    
+    def _cleanup_worker(self, task_id: str):
+        """清理已完成的工作线程"""
+        for worker in self._active_workers[:]:
+            if worker.isFinished():
+                self._active_workers.remove(worker)
+    
+    def _update_category_combo(self):
+        """更新标识下拉框"""
+        self.category_combo.clear()
+        for category in self.categories:
+            self.category_combo.addItem(category['name'], category['id'])
+            index = self.category_combo.count() - 1
+            self.category_combo.setItemData(index, QColor(category['color']), Qt.ForegroundRole)
+            self.category_combo.setItemData(index, QBrush(QColor(category['color']).lighter(160)), Qt.BackgroundRole)
+        
+        if self.categories:
+            self.category_combo.setCurrentIndex(0)
+    
+    def _update_filter_combo(self):
+        """更新筛选下拉框"""
+        current_filter = self.category_filter.currentData()
+        self.category_filter.clear()
+        self.category_filter.addItem("全部", -1)
+        
+        for category in self.categories:
+            self.category_filter.addItem(category['name'], category['id'])
+            index = self.category_filter.count() - 1
+            self.category_filter.setItemData(index, QColor(category['color']), Qt.ForegroundRole)
+            self.category_filter.setItemData(index, QBrush(QColor(category['color']).lighter(160)), Qt.BackgroundRole)
+        
+        # 恢复之前的筛选状态
+        if current_filter and current_filter != -1:
+            idx = self.category_filter.findData(current_filter)
+            if idx >= 0:
+                self.category_filter.setCurrentIndex(idx)
+    
+    def _load_categories(self):
+        """加载所有标识（异步）"""
+        if not self.category_manager or not self.current_db_path:
             return
         
-        try:
-            stats = self.category_manager.get_category_stats()
-            self._update_stats_table(stats)  # 调用专门的方法更新表格
-            
-            # 添加调试输出
-            print(f"统计表格已刷新，共 {len(stats)} 条记录")
-            
-        except Exception as e:
-            print(f"加载标识统计失败: {e}")
+        worker = DatabaseLoadWorker(self.current_db_path, "categories")
+        worker.finished_signal.connect(self._on_categories_loaded)
+        worker.error_signal.connect(self._on_data_load_error)
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker)
+    
+    def _on_categories_loaded(self, result):
+        """标识加载完成回调"""
+        categories = result.get("categories", [])
+        if categories:
+            self.categories = categories
+            self.categories_dict = {c['id']: c for c in self.categories}
+            self._update_category_combo()
+            self._update_filter_combo()
+            self._load_category_stats()
+            self._update_category_stats()
+            self._calculate_interval()
+    
+    def _load_records(self):
+        """加载记录（异步）"""
+        if not self.current_db_path:
+            return
+        
+        worker = DatabaseLoadWorker(self.current_db_path, "records")
+        worker.sort_mode = self.records_model.sort_mode
+        worker.finished_signal.connect(self._on_records_loaded)
+        worker.error_signal.connect(self._on_data_load_error)
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker)
+    
+    def _on_records_loaded(self, result):
+        """记录加载完成回调"""
+        records = result.get("records", [])
+        category_map = result.get("category_map", {})
+        self.records_model.set_records(records, category_map)
+        
+        # 更新状态栏统计
+        stats = self.records_model.get_interval_stats()
+        if stats:
+            min_interval = self._format_interval(stats["min"])
+            max_interval = self._format_interval(stats["max"])
+            avg_interval = self._format_interval(stats["avg"])
+            self.status_bar.showMessage(
+                f"📊 间隔统计 - 最短: {min_interval} | 最长: {max_interval} | 平均: {avg_interval} | 记录数: {stats['count']}",
+                5000
+            )
+    
+    def _load_category_stats(self, force_refresh=True):
+        """加载所有标识的统计信息（异步）"""
+        if not self.category_manager or not self.current_db_path:
+            return
+        
+        worker = DatabaseLoadWorker(self.current_db_path, "stats")
+        worker.finished_signal.connect(self._on_stats_only_loaded)
+        worker.error_signal.connect(self._on_data_load_error)
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker)
+    
+    def _on_stats_only_loaded(self, result):
+        """仅统计信息加载完成回调"""
+        stats = result.get("stats", [])
+        if stats:
+            self._update_stats_table(stats)
     
     def _format_interval(self, seconds: float) -> str:
         """格式化时间间隔"""
@@ -4559,7 +5341,7 @@ class MainWindow(QMainWindow):
                 self._load_category_stats()
     
     def _filter_by_category(self):
-        """按标识筛选"""
+        """按标识筛选（异步）"""
         category_id = self.category_filter.currentData()
         
         if category_id == -1:
@@ -4569,42 +5351,15 @@ class MainWindow(QMainWindow):
         if not self.current_db_path:
             return
         
-        try:
-            conn = self.user_manager.db_pool.get_connection(self.current_db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute("""
-                SELECT r.id, r.category_id, r.record_date, r.record_time, 
-                       r.content, r.notes, r.created_at, r.updated_at,
-                       c.name as category_name, c.color
-                FROM scheduling_records r
-                JOIN categories c ON r.category_id = c.id
-                WHERE r.category_id = ?
-                ORDER BY r.record_date DESC, r.record_time DESC
-            """, (category_id,))
-            
-            records = []
-            category_map = {}
-            for row in cursor.fetchall():
-                records.append({
-                    "id": row[0],
-                    "category_id": row[1],
-                    "record_date": row[2],
-                    "record_time": row[3],
-                    "content": row[4],
-                    "notes": row[5],
-                    "created_at": row[6],
-                    "updated_at": row[7]
-                })
-                category_map[row[1]] = row[8]
-            
-            self.records_model.set_records(records, category_map)
-            
-        except Exception as e:
-            print(f"筛选失败: {e}")
+        worker = DatabaseLoadWorker(self.current_db_path, "filter", category_id=category_id)
+        worker.sort_mode = self.records_model.sort_mode
+        worker.finished_signal.connect(self._on_records_loaded)
+        worker.error_signal.connect(self._on_data_load_error)
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker)
     
     def _search_records(self):
-        """搜索记录"""
+        """搜索记录（异步）"""
         keyword = self.search_edit.text().strip()
         category_id = self.category_filter.currentData()
         
@@ -4612,57 +5367,21 @@ class MainWindow(QMainWindow):
             self._load_records()
             return
         
-        try:
-            conn = self.user_manager.db_pool.get_connection(self.current_db_path)
-            cursor = conn.cursor()
-            
-            if category_id != -1:
-                cursor.execute("""
-                    SELECT r.id, r.category_id, r.record_date, r.record_time, 
-                           r.content, r.notes, r.created_at, r.updated_at,
-                           c.name as category_name, c.color
-                    FROM scheduling_records r
-                    JOIN categories c ON r.category_id = c.id
-                    WHERE r.category_id = ?
-                    ORDER BY r.record_date DESC, r.record_time DESC
-                """, (category_id,))
-            else:
-                cursor.execute("""
-                    SELECT r.id, r.category_id, r.record_date, r.record_time, 
-                           r.content, r.notes, r.created_at, r.updated_at,
-                           c.name as category_name, c.color
-                    FROM scheduling_records r
-                    JOIN categories c ON r.category_id = c.id
-                    ORDER BY r.record_date DESC, r.record_time DESC
-                """)
-            
-            records = []
-            category_map = {}
-            for row in cursor.fetchall():
-                record = {
-                    "id": row[0],
-                    "category_id": row[1],
-                    "record_date": row[2],
-                    "record_time": row[3],
-                    "content": row[4],
-                    "notes": row[5],
-                    "created_at": row[6],
-                    "updated_at": row[7]
-                }
-                category_map[row[1]] = row[8]
-                
-                if not keyword:
-                    records.append(record)
-                else:
-                    category_name = row[8]
-                    search_text = f"{category_name} {row[4]} {row[5] or ''}"
-                    if SearchHelper.match_keyword(search_text, keyword):
-                        records.append(record)
-            
-            self.records_model.set_records(records, category_map)
-            
-        except Exception as e:
-            print(f"搜索失败: {e}")
+        if not self.current_db_path:
+            return
+        
+        # 如果有分类筛选，使用filter模式；否则使用search模式
+        if category_id != -1:
+            worker = DatabaseLoadWorker(self.current_db_path, "search", 
+                                        category_id=category_id, keyword=keyword)
+        else:
+            worker = DatabaseLoadWorker(self.current_db_path, "search", keyword=keyword)
+        
+        worker.sort_mode = self.records_model.sort_mode
+        worker.finished_signal.connect(self._on_records_loaded)
+        worker.error_signal.connect(self._on_data_load_error)
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker)
     
     def _show_category_manager(self):
         """显示标识管理对话框"""
@@ -4680,35 +5399,38 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("ℹ️ 标识未作修改", 2000)
 
     def _refresh_all_data(self):
-        """刷新所有数据（完全重新加载）"""
+        """刷新所有数据（异步）"""
         print("开始完全刷新所有数据...")  # 调试输出
         
-        # 1. 首先重新加载所有标识（从数据库）
-        self._load_categories()
+        if not self.current_db_path:
+            return
         
-        # 2. 强制重新加载标识统计信息（从数据库）
-        if self.category_manager:
-            # 清除可能的缓存
-            stats = self.category_manager.get_category_stats()
-            self._update_stats_table(stats)  # 使用新的方法来更新统计表格
+        # 显示加载进度
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)
+        self.status_bar.showMessage("⏳ 正在刷新数据...")
         
-        # 3. 重新加载记录列表
-        self._load_records()
+        # 使用后台线程加载全部数据
+        worker = DatabaseLoadWorker(self.current_db_path, "all")
+        worker.sort_mode = self.records_model.sort_mode
+        worker.finished_signal.connect(self._on_refresh_complete)
+        worker.error_signal.connect(self._on_data_load_error)
+        worker.progress_signal.connect(self._on_load_progress)
         
-        # 4. 更新当前选中的标识信息
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker, "refresh_all")
+    
+    def _on_refresh_complete(self, result):
+        """刷新完成回调"""
+        self._on_data_loaded(result)
         self._update_category_stats()
-        
-        # 5. 重新计算时间间隔
         self._calculate_interval()
         
-        # 6. 刷新筛选下拉框的显示
-        self._refresh_filter_combo()
-        
-        # 7. 强制界面重绘
-        self.repaint()
+        # 强制界面重绘
         self.stats_table.viewport().update()
         self.records_table.viewport().update()
         
+        self.progress_bar.setVisible(False)
         print("数据刷新完成")  # 调试输出
 
     def _update_stats_table(self, stats):
@@ -4762,27 +5484,6 @@ class MainWindow(QMainWindow):
             
         except Exception as e:
             print(f"更新统计表格失败: {e}")
-
-    def _refresh_filter_combo(self):
-        """刷新筛选下拉框"""
-        try:
-            current_filter = self.category_filter.currentData()
-            self.category_filter.clear()
-            self.category_filter.addItem("全部", -1)
-            
-            for category in self.categories:
-                self.category_filter.addItem(category['name'], category['id'])
-                index = self.category_filter.count() - 1
-                self.category_filter.setItemData(index, QColor(category['color']), Qt.ForegroundRole)
-                self.category_filter.setItemData(index, QBrush(QColor(category['color']).lighter(160)), Qt.BackgroundRole)
-            
-            # 恢复之前的筛选状态
-            if current_filter != -1:
-                index = self.category_filter.findData(current_filter)
-                if index >= 0:
-                    self.category_filter.setCurrentIndex(index)
-        except Exception as e:
-            print(f"刷新筛选下拉框失败: {e}")
     
     def _switch_user(self):
         """切换用户"""
@@ -4801,48 +5502,56 @@ class MainWindow(QMainWindow):
                 self._load_records()
     
     def _manual_backup(self):
-        """手动备份（修复版）"""
+        """手动备份（异步多线程版）"""
         if not self.backup_manager:
             return
         
         # 显示进度条
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # 忙碌状态
-        QCoreApplication.processEvents()  # 强制更新UI
+        self.status_bar.showMessage("⏳ 正在创建备份...")
         
-        try:
-            # 直接执行备份，不创建线程
-            backup_path = self.backup_manager.create_backup("manual")
-            
-            # 隐藏进度条
-            self.progress_bar.setVisible(False)
-            
-            if backup_path:
-                # 获取文件大小
-                file_size = backup_path.stat().st_size
-                if file_size < 1024:
-                    size_str = f"{file_size} B"
-                elif file_size < 1024 * 1024:
-                    size_str = f"{file_size / 1024:.2f} KB"
-                else:
-                    size_str = f"{file_size / (1024 * 1024):.2f} MB"
-                
-                QMessageBox.information(
-                    self, "成功", 
-                    f"✅ 备份创建成功\n"
-                    f"文件：{backup_path.name}\n"
-                    f"大小：{size_str}\n"
-                    f"耗时：{self.backup_manager.last_backup_time:.3f} 秒"
-                )
-            else:
-                QMessageBox.critical(self, "错误", "❌ 备份创建失败")
-        except Exception as e:
-            self.progress_bar.setVisible(False)
-            self._show_error("备份失败", str(e))
+        # 创建后台备份线程
+        worker = BackupWorker(self.backup_manager, "manual")
+        worker.finished_signal.connect(self._on_backup_finished)
+        worker.error_signal.connect(self._on_backup_error)
+        worker.progress_signal.connect(self._on_load_progress)
+        
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker, "manual_backup")
     
-    def _backup_finished(self, backup_path):
-        """备份完成（不再使用）"""
-        pass
+    def _on_backup_finished(self, result):
+        """备份完成回调"""
+        self.progress_bar.setVisible(False)
+        self._cleanup_worker("manual_backup")
+        
+        backup_path = result.get("backup_path")
+        file_size = result.get("file_size", 0)
+        backup_time = result.get("backup_time", 0)
+        
+        if backup_path:
+            if file_size < 1024:
+                size_str = f"{file_size} B"
+            elif file_size < 1024 * 1024:
+                size_str = f"{file_size / 1024:.2f} KB"
+            else:
+                size_str = f"{file_size / (1024 * 1024):.2f} MB"
+            
+            QMessageBox.information(
+                self, "成功", 
+                f"✅ 备份创建成功\n"
+                f"文件：{Path(backup_path).name}\n"
+                f"大小：{size_str}\n"
+                f"耗时：{backup_time:.3f} 秒"
+            )
+        else:
+            QMessageBox.critical(self, "错误", "❌ 备份创建失败")
+    
+    def _on_backup_error(self, error_msg):
+        """备份出错回调"""
+        self.progress_bar.setVisible(False)
+        self._cleanup_worker("manual_backup")
+        self._show_error("备份失败", error_msg)
     
     def _auto_backup(self):
         """自动备份"""
@@ -4896,12 +5605,25 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """关闭事件"""
         self._save_settings()
+        
+        # 停止自动备份定时器
+        self.auto_backup_timer.stop()
+        
+        # 取消所有活跃的后台任务
+        for worker in self._active_workers:
+            if not worker.isFinished():
+                worker.cancel()
+        
+        # 等待线程池完成（最多2秒）
+        self.task_manager.wait_for_done(2000)
+        
+        # 关闭所有数据库连接
         self.user_manager.db_pool.close_all()
         event.accept()
 
     def _refresh_stats(self):
-        """刷新标识统计信息"""
-        if not self.category_manager:
+        """刷新标识统计信息（异步）"""
+        if not self.category_manager or not self.current_db_path:
             return
         
         # 显示正在刷新状态
@@ -4909,24 +5631,35 @@ class MainWindow(QMainWindow):
         self.refresh_stats_btn.setText("⏳ 刷新中...")
         self.status_bar.showMessage("正在刷新标识统计...", 2000)
         
-        # 使用 QTimer.singleShot 让 UI 有机会更新
-        QTimer.singleShot(100, self._do_refresh_stats)
-
-    def _do_refresh_stats(self):
-        """实际执行刷新统计"""
+        # 使用后台线程加载统计数据
+        worker = DatabaseLoadWorker(self.current_db_path, "all")
+        worker.sort_mode = self.records_model.sort_mode
+        worker.finished_signal.connect(self._on_stats_refresh_complete)
+        worker.error_signal.connect(self._on_stats_refresh_error)
+        
+        self._active_workers.append(worker)
+        self.task_manager.submit(worker, "refresh_stats")
+    
+    def _on_stats_refresh_complete(self, result):
+        """统计刷新完成回调"""
         try:
-            # 重新加载所有标识
-            self._load_categories()
+            categories = result.get("categories", [])
+            if categories:
+                self.categories = categories
+                self.categories_dict = {c['id']: c for c in self.categories}
+                self._update_category_combo()
+                self._update_filter_combo()
             
-            # 重新加载标识统计信息
-            if self.category_manager:
-                stats = self.category_manager.get_category_stats()
+            stats = result.get("stats", [])
+            if stats:
                 self._update_stats_table(stats)
             
-            # 更新当前选中的标识信息
-            self._update_category_stats()
+            records = result.get("records", [])
+            category_map = result.get("category_map", {})
+            if records is not None:
+                self.records_model.set_records(records, category_map)
             
-            # 重新计算时间间隔
+            self._update_category_stats()
             self._calculate_interval()
             
             # 强制界面重绘
@@ -4938,9 +5671,16 @@ class MainWindow(QMainWindow):
             print(f"刷新统计失败: {e}")
             self._show_error("刷新失败", str(e))
         finally:
-            # 恢复按钮状态
             self.refresh_stats_btn.setEnabled(True)
             self.refresh_stats_btn.setText("🔄 刷新统计")
+            self._cleanup_worker("refresh_stats")
+    
+    def _on_stats_refresh_error(self, error_msg):
+        """统计刷新出错回调"""
+        self.refresh_stats_btn.setEnabled(True)
+        self.refresh_stats_btn.setText("🔄 刷新统计")
+        self._cleanup_worker("refresh_stats")
+        self._show_error("刷新失败", error_msg)
 
 class RecordEditDialog(QDialog):
     """记录编辑对话框"""
